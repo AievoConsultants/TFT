@@ -1,0 +1,51 @@
+name: Build TFT Meta Snapshot
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 */6 * * *"  # every 6 hours (your choice D.2)
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - run: npm ci
+
+      - name: Make .env
+        run: |
+          cp .env.example .env
+          # Insert your temporary dev key from repo secret
+          sed -i "s|replace_me|${{ secrets.RIOT_API_KEY }}|g" .env
+          # Lock to your chosen platforms and patch
+          echo "PLATFORMS=NA1,EUW1,KR" >> .env
+          echo "PATCH=15.4" >> .env
+          # Your sample size and thresholds
+          echo "SEED_SUMMONERS=1500" >> .env
+          echo "MATCHES_PER=20" >> .env
+          echo "MIN_PICKS=200" >> .env
+          echo "MIN_PICKS_ITEM_COMBO=50" >> .env
+
+      - name: Run pipeline
+        run: npm start
+
+      - name: Commit updated data
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/*.json
+          git commit -m "Update meta (patch 15.4 merged NA1/EUW1/KR, Dia+Masters+)" || echo "No changes"
+          git push
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: meta-15.4
+          path: |
+            data/meta_15.4.json
+            data/meta_current.json
