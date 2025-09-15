@@ -31,44 +31,71 @@ function regionFor(p: Platform): Region {
   return "ASIA"; // KR, JP1, OC1
 }
 
-// ----- Seeding helpers -----
-async function seedSummonerIdsForPlatform(platform: Platform) {
-  const ids: string[] = [];
+const summonerIds = await seedSummonerIdsForPlatform(PLATFORM as Platform);
+if (summonerIds.length === 0) {
+  console.error(`[Fatal] No summonerIds returned from league endpoints. Check key/routing.`);
+  process.exit(1);
+}
+const puuids = await toPuuids(PLATFORM as Platform, summonerIds, Number(SEED_SUMMONERS));
+if (puuids.length === 0) {
+  console.error(`[Fatal] Could not convert any summonerIds to PUUIDs. Check SUMMONER endpoint access.`);
+  process.exit(1);
+}
 
-  // Masters+
+  // Masters+ leagues
   for (const tier of ["CHALLENGER", "GRANDMASTER", "MASTER"] as const) {
     try {
       const entries = await leagueListMasterPlus(platform, tier, RIOT_API_KEY);
-      for (const e of entries) ids.push(e.summonerId);
-    } catch {}
-  }
-
-  // Diamond (I..IV, pages 1..N)
-  const pages = 10; // be greedy; we’ll cap by SEED_SUMMONERS later
-  for (const div of ["I","II","III","IV"] as const) {
-    for (let page=1; page<=pages; page++) {
-      try {
-        const pageRows = await leagueEntriesPaged(platform, "DIAMOND", div, page, RIOT_API_KEY);
-        if (!pageRows || pageRows.length === 0) break;
-        for (const e of pageRows) ids.push(e.summonerId);
-      } catch { break; }
+      console.log(`[League] ${platform} ${tier} entries=${entries.length}`);
+      // entries contain { summonerId: encryptedSummonerId }
+      for (const e of entries) if (e?.summonerId) ids.push(e.summonerId);
+    } catch (e: any) {
+      console.warn(`[League] ${platform} ${tier} failed: ${e?.message || e}`);
     }
   }
 
-  // de-dupe
-  return [...new Set(ids)];
+  // DIAMOND I..IV, first 10 pages each
+  for (const div of ["I", "II", "III", "IV"] as const) {
+    for (let page = 1; page <= 10; page++) {
+      try {
+        const rows = await leagueEntriesPaged(platform, "DIAMOND", div, page, RIOT_API_KEY);
+        console.log(`[League] ${platform} DIAMOND ${div} page=${page} rows=${rows.length}`);
+        if (!rows.length) break;
+        for (const e of rows) if (e?.summonerId) ids.push(e.summonerId);
+      } catch (e: any) {
+        console.warn(`[League] ${platform} DIAMOND ${div} page=${page} failed: ${e?.message || e}`);
+        break;
+      }
+    }
+  }
+
+  const unique = [...new Set(ids)];
+  console.log(`[Seed] ${platform} total summonerIds=${unique.length}`);
+  return unique;
 }
 
+
 async function toPuuids(platform: Platform, ids: string[], cap: number) {
+  const take = Math.min(ids.length, cap);
+  console.log(`[PUUID] ${platform} converting ${take}/${ids.length} summonerIds`);
   const limit = pLimit(16);
-  const out = await Promise.all(ids.slice(0, cap).map(id =>
+
+  const out = await Promise.all(ids.slice(0, take).map(id =>
     limit(async () => {
-      try { const s = await summonerById(platform, id, RIOT_API_KEY); return s.puuid; }
-      catch { return null; }
+      try {
+        const s = await summonerById(platform, id, RIOT_API_KEY);
+        return s?.puuid || null;
+      } catch (e: any) {
+        console.warn(`[Summoner] ${platform} summonerId=${id} failed: ${e?.message || e}`);
+        return null;
+      }
     })
   ));
-  return [...new Set(out.filter(Boolean) as string[])];
+  const puuids = [...new Set(out.filter(Boolean) as string[])];
+  console.log(`[PUUID] ${platform} unique puuids=${puuids.length}`);
+  return puuids;
 }
+
 
 // ----- Match pulling -----
 async function pullMatchesForPlatform(platform: Platform, puuids: string[], per: number) {
@@ -81,7 +108,9 @@ async function pullMatchesForPlatform(platform: Platform, puuids: string[], per:
       try {
         const arr = await matchIdsByPuuid(region, puuid, per, RIOT_API_KEY);
         for (const id of arr) idSet.add(id);
-      } catch {} // skip 429/other errors
+      } catch (e: any) {
+        console.warn(`[MatchIDs] ${platform}/${region} puuid=${puuid} failed: ${e?.message || e}`);
+      }
     })
   ));
 
@@ -89,10 +118,11 @@ async function pullMatchesForPlatform(platform: Platform, puuids: string[], per:
   const matches = (await Promise.all([...idSet].map(id =>
     limitMatch(async () => {
       try { return await getMatch(region, id, RIOT_API_KEY); }
-      catch { return null; }
+      catch (e: any) { console.warn(`[Match] ${platform}/${region} id=${id} failed: ${e?.message || e}`); return null; }
     })
   ))).filter(Boolean);
 
+  console.log(`[Matches] ${platform} fetched=${matches.length}`);
   return matches as any[];
 }
 
