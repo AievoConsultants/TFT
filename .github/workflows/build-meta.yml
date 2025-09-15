@@ -3,11 +3,15 @@ name: Build TFT Meta Snapshot
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 */6 * * *"  # every 6 hours (your choice D.2)
+    - cron: "0 */6 * * *"  # every 6 hours
+
+permissions:
+  contents: write  # needed for committing data files back to the repo
 
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
 
@@ -15,17 +19,16 @@ jobs:
         with:
           node-version: 20
 
-    - run: npm install --no-audit --no-fund
+      # Use npm install (no lockfile required)
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
 
       - name: Make .env
         run: |
           cp .env.example .env
-          # Insert your temporary dev key from repo secret
           sed -i "s|replace_me|${{ secrets.RIOT_API_KEY }}|g" .env
-          # Lock to your chosen platforms and patch
           echo "PLATFORMS=NA1,EUW1,KR" >> .env
           echo "PATCH=15.4" >> .env
-          # Your sample size and thresholds
           echo "SEED_SUMMONERS=1500" >> .env
           echo "MATCHES_PER=20" >> .env
           echo "MIN_PICKS=200" >> .env
