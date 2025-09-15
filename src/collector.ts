@@ -9,19 +9,19 @@ import {
   matchIdsByPuuid, getMatch
 } from "./riot.js";
 
-// === Minimal env (key + optional knobs) ===
 const {
   RIOT_API_KEY,
   PLATFORMS = "NA1,EUW1,KR",
-  SEED_SUMMONERS = "1500",     // width: how many Diamond+ accounts per platform to sample
-  MAX_AGE_DAYS = "7"           // recency window (days). "most current" default = 7
+  SEED_SUMMONERS = "1500",
+  MATCHES_PER = "10",
+  // keep collector wide-open for patch/time; we filter later in aggregator
+  PATCH = "",
+  QUEUE_FILTER = "1100",   // ranked only
+  MAX_AGE_DAYS = "0",      // 0 = no time filter in collector
+  SKIP_DEDUPE = "0"        // set to "1" for a test run to force appends
 } = process.env as Record<string,string>;
 
 if (!RIOT_API_KEY) { console.error("Missing RIOT_API_KEY"); process.exit(1); }
-
-// === Hard filters per your request ===
-const RANKED_QUEUE = 1100;     // TFT Ranked (Standard) only
-const MATCHES_PER = 20;        // recent matches per PUUID (depth). keep fixed.
 
 function normalizePatch(v: string) {
   const m = v?.match?.(/(\d+)\.(\d+)/);
@@ -36,7 +36,6 @@ function withinAge(info: any, maxDays: number): boolean {
   return (Date.now() - t) / 86400000 <= d;
 }
 
-// --- seed Diamond+ accounts (Challenger/GM/Master lists + Diamond pages) ---
 async function seedSummonerIdsForPlatform(platform: Platform) {
   const ids: string[] = [];
   for (const tier of ["CHALLENGER","GRANDMASTER","MASTER"] as const) {
@@ -85,18 +84,19 @@ type Slice = {
 async function run() {
   const platforms = PLATFORMS.split(",").map(s=>s.trim()).filter(Boolean) as Platform[];
   const today = new Date().toISOString().slice(0,10).replace(/-/g,"");
-  const outDir = path.join("data","staging","all"); // always write to ALL (no patch filter here)
+  const outDir = path.join("data","staging","all");
   await fs.mkdir(outDir, { recursive: true });
   const outFile = path.join(outDir, `participants-${today}.ndjson`);
 
+  // dedupe state
   const stateDir = path.join("data","state");
   await fs.mkdir(stateDir, { recursive: true });
   const seenPath = path.join(stateDir, "seen_match_ids.json");
-
   let seen = new Set<string>();
   try { seen = new Set(JSON.parse(await fs.readFile(seenPath,"utf8"))); } catch {}
 
   let totalAppended = 0;
+  const queueFilterNum = Number(QUEUE_FILTER) || 0;
   const maxAgeDaysNum = Number(MAX_AGE_DAYS) || 0;
 
   for (const platform of platforms) {
@@ -111,7 +111,7 @@ async function run() {
     await Promise.all(puuids.map(puuid =>
       limitIds(async () => {
         try {
-          const arr = await matchIdsByPuuid(region, puuid, MATCHES_PER, RIOT_API_KEY);
+          const arr = await matchIdsByPuuid(region, puuid, Number(MATCHES_PER), RIOT_API_KEY);
           for (const id of arr) matchIds.add(id);
         } catch {}
       })
@@ -121,20 +121,22 @@ async function run() {
 
     const limitMatch = pLimit(4);
     const lines: string[] = [];
-    let dropQueue=0, dropAge=0, dropEmpty=0;
+    let dropQueue=0, dropAge=0, dropPatch=0, dropEmpty=0, fetchFail=0, processed=0, deduped=0;
 
     await Promise.all([...matchIds].map(mid =>
       limitMatch(async () => {
-        if (seen.has(mid)) return;
+        if (SKIP_DEDUPE !== "1" && seen.has(mid)) { deduped++; return; }
         try {
           const m = await getMatch(region, mid, RIOT_API_KEY);
 
           const queue = m?.info?.queue_id ?? m?.info?.queueId;
-          if (Number(queue) !== RANKED_QUEUE) { dropQueue++; return; } // RANKED ONLY
-
-          if (!withinAge(m?.info, maxAgeDaysNum)) { dropAge++; return; } // RECENT ONLY
+          if (queueFilterNum && Number(queue) !== queueFilterNum) { dropQueue++; return; }
 
           const patch = normalizePatch(m?.info?.game_version);
+          if (PATCH && patch !== PATCH) { dropPatch++; return; }
+
+          if (!withinAge(m?.info, maxAgeDaysNum)) { dropAge++; return; }
+
           const parts = m?.info?.participants || [];
           if (!parts.length) { dropEmpty++; return; }
 
@@ -144,16 +146,16 @@ async function run() {
               items: Array.isArray(u.items) ? u.items : (Array.isArray(u.itemNames) ? u.itemNames : [])
             }));
             lines.push(JSON.stringify({
-              match_id: mid, platform, region, patch,
-              placement: p.placement ?? 9, units
+              match_id: mid, platform, region, patch, placement: p.placement ?? 9, units
             }));
           }
-          seen.add(mid);
-        } catch {}
+          processed++;
+          if (SKIP_DEDUPE !== "1") seen.add(mid);
+        } catch { fetchFail++; }
       })
     ));
 
-    console.log(`[Filters] dropQueue=${dropQueue} dropAge=${dropAge} dropEmpty=${dropEmpty}`);
+    console.log(`[Filters] platform=${platform} deduped=${deduped} dropQueue=${dropQueue} dropAge=${dropAge} dropPatch=${dropPatch} dropEmpty=${dropEmpty} fetchFail=${fetchFail} processed=${processed}`);
     if (lines.length) {
       await fs.appendFile(outFile, lines.join("\n") + "\n", "utf8");
       console.log(`[Write] ${platform} appended ${lines.length} slices to ${outFile}`);
@@ -163,10 +165,14 @@ async function run() {
     }
   }
 
-  const keep = Array.from(seen).slice(-500000);
-  await fs.writeFile(seenPath, JSON.stringify(keep));
+  // only persist dedupe when not skipping
+  if (SKIP_DEDUPE !== "1") {
+    const keep = Array.from(seen).slice(-500000);
+    await fs.writeFile(seenPath, JSON.stringify(keep));
+  }
+
   console.log(`[Collector] wrote total ${totalAppended} slices → ${outFile}`);
-  if (totalAppended === 0) console.warn("[Collector] 0 slices appended — check PUUID/filters logs above.");
+  if (totalAppended === 0) console.warn("[Collector] 0 slices appended — see drop counters above.");
 }
 
 run().catch(e => { console.error(e); process.exit(1); });
