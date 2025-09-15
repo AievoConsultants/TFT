@@ -1,73 +1,19 @@
-// Aggregation for comps (by avg placement) + separate unit 3-item combo meta.
+import "dotenv/config";
+import fs from "node:fs/promises";
+import path from "node:path";
+import { finalizeComps, finalizeUnitCombos, CompCounts, compSignature, unitSet } from "./aggregate.js";
 
-export type ItemKey = number | string; // accept numeric IDs or names
-export type Unit = { character_id: string; items: ItemKey[] };
-export type Participant = { placement: number; units: Unit[] };
-export type MatchInfo = { game_version: string; participants: Participant[] };
-
-export type CompKey = string;
-
-export function normalizePatch(v: string): string {
-  const m = v?.match?.(/(\d+)\.(\d+)/);
-  return m ? `${m[1]}.${m[2]}` : v ?? "unknown";
-}
-
-// Signature: units + their item multiset (so forks like AD/AP split)
-export function compSignature(units: Unit[]): CompKey {
-  const sig = (units || [])
-    .map(u => `${u.character_id}:${[...(u.items||[])].map(String).sort().join(".")}`)
-    .sort()
-    .join("|");
-  return sig;
-}
-export function unitSet(units: Unit[]): string[] {
-  return [...new Set((units||[]).map(u => u.character_id))].sort();
-}
-
-type ItemCount = Map<string, number>;            // item id -> count
-type UnitBag = Map<string, ItemCount>;           // character_id -> ItemCount
-
-export type CompCounts = {
+type Slice = {
+  match_id: string;
+  platform: string;
+  region: string;
   patch: string;
-  comp_key: CompKey;
-  picks: number;
-  wins: number;
-  sumPlacement: number;
-  units: UnitBag;
-  unit_set: string[];
+  placement: number;
+  units: Array<{ character_id: string; items: Array<number|string> }>;
 };
-
-export type CompRow = {
-  patch: string;
-  comp_key: CompKey;
-  picks: number;
-  avg_placement: number;
-  winrate: number;
-  unit_set: string[];
-  units: Array<{
-    character_id: string;
-    top_items: string[];                // top 3 items by frequency
-    item_freq: Array<[string, number]>; // [itemKey, probability]
-  }>;
-};
-
-// --------- Unit 3-item combos (independent of comp) ---------
-export type ComboKey = string; // e.g., "DB|IE|GS" (sorted names or numeric strings)
-export type ComboCounts = { picks: number; wins: number; sumPlacement: number };
-export type UnitComboBag = Map<string, Map<ComboKey, ComboCounts>>; // unit -> comboKey -> counts
-
-function inc(map: ItemCount, k: string, v = 1) { map.set(k, (map.get(k)||0)+v); }
-function freqFromCounts(counts: ItemCount): Array<[string, number]> {
-  let total = 0; for (const c of counts.values()) total += c;
-  const out: Array<[string, number]> = [];
-  for (const [id, c] of counts.entries()) out.push([id, total ? c/total : 0]);
-  out.sort((a,b)=>b[1]-a[1]); return out;
-}
 
 function combosOf3(items: string[]): string[] {
-  // unique sorted combos of size 3
-  const uniq = [...new Set(items)];
-  uniq.sort();
+  const uniq = [...new Set(items.map(String))].sort();
   const out: string[] = [];
   for (let i=0;i<uniq.length;i++)
     for (let j=i+1;j<uniq.length;j++)
@@ -76,166 +22,110 @@ function combosOf3(items: string[]): string[] {
   return out;
 }
 
-// ------- Aggregate both comp counts and unit combo counts -------
-export function aggregateCountsAndCombos(matches: any[], patchFilter: string) {
-  const compBuckets = new Map<string, CompCounts>(); // key: `${patch}::${comp_key}`
-  const unitCombos: UnitComboBag = new Map();
+const {
+  PATCH = "",
+  MIN_PICKS = "200",
+  MIN_PICKS_ITEM_COMBO = "50"
+} = process.env as Record<string,string>;
 
-  for (const m of matches) {
-    const info: MatchInfo = m?.info;
-    if (!info?.participants) continue;
-    const patch = normalizePatch(info.game_version);
-    if (patchFilter && patch !== patchFilter) continue;
-
-    for (const p of info.participants) {
-      const units: Unit[] = (p.units || []).map((u: any) => ({
-        character_id: u.character_id,
-        items: Array.isArray(u.items)
-          ? (u.items as ItemKey[])
-          : Array.isArray(u.itemNames) ? (u.itemNames as ItemKey[]) : []
-      }));
-
-      // --- comp counts ---
-      const key = `${patch}::${compSignature(units)}`;
-      let bag = compBuckets.get(key);
-      if (!bag) {
-        bag = {
-          patch, comp_key: key.split("::")[1],
-          picks: 0, wins: 0, sumPlacement: 0,
-          units: new Map(), unit_set: unitSet(units)
-        };
-        compBuckets.set(key, bag);
-      }
-      bag.picks += 1;
-      if (p.placement === 1) bag.wins += 1;
-      bag.sumPlacement += p.placement ?? 9;
-      for (const u of units) {
-        let itemBag = bag.units.get(u.character_id);
-        if (!itemBag) { itemBag = new Map(); bag.units.set(u.character_id, itemBag); }
-        for (const it of (u.items || [])) inc(itemBag, String(it));
-      }
-
-      // --- unit 3-item combos (independent of comp) ---
-      for (const u of units) {
-        const items = (u.items || []).map(String);
-        if (items.length < 3) continue;
-        const combos = combosOf3(items);
-        if (combos.length === 0) continue;
-
-        let unitBag = unitCombos.get(u.character_id);
-        if (!unitBag) { unitBag = new Map(); unitCombos.set(u.character_id, unitBag); }
-
-        for (const cKey of combos) {
-          let c = unitBag.get(cKey);
-          if (!c) { c = { picks: 0, wins: 0, sumPlacement: 0 }; unitBag.set(cKey, c); }
-          c.picks += 1;
-          if (p.placement === 1) c.wins += 1;
-          c.sumPlacement += p.placement ?? 9;
-        }
+async function readAllSlices(): Promise<Slice[]> {
+  const patchDir = PATCH ? PATCH : "all";
+  const dir = path.join("data","staging", patchDir);
+  try {
+    const entries = await fs.readdir(dir);
+    const files = entries.filter(f => f.endsWith(".ndjson"));
+    const all: Slice[] = [];
+    for (const f of files) {
+      const txt = await fs.readFile(path.join(dir,f), "utf8");
+      for (const line of txt.split("\n")) {
+        if (!line.trim()) continue;
+        try { all.push(JSON.parse(line)); } catch {}
       }
     }
+    return all;
+  } catch {
+    return [];
   }
-
-  return { compBuckets, unitCombos };
 }
 
-export function finalizeComps(compBuckets: Map<string, CompCounts>, minPicks: number): CompRow[] {
-  const out: CompRow[] = [];
-  for (const [, c] of compBuckets) {
-    if (c.picks < minPicks) continue;
-    const units = Array.from(c.units.entries()).map(([cid, bag]) => {
-      const freq = freqFromCounts(bag);
-      return {
-        character_id: cid,
-        top_items: freq.slice(0,3).map(([id])=>id),
-        item_freq: freq
-      };
-    });
-    out.push({
-      patch: c.patch,
-      comp_key: c.comp_key,
-      picks: c.picks,
-      avg_placement: +(c.sumPlacement / c.picks).toFixed(2),
-      winrate: +(c.wins / c.picks * 100).toFixed(1),
-      unit_set: c.unit_set,
-      units
-    });
+async function run() {
+  const slices = await readAllSlices();
+  if (slices.length === 0) {
+    console.error(`[Aggregator] No slices found. Did the collector run?`);
   }
-  out.sort((a,b)=> a.avg_placement - b.avg_placement || b.picks - a.picks);
-  return out.slice(0, 20);
-}
 
-export type UnitComboRow = {
-  unit: string;
-  combos: Array<{
-    combo: string[];       // 3 items in sorted order
-    picks: number;
-    avg_placement: number;
-    winrate: number;
-  }>;
-};
+  // comp buckets
+  const compBuckets = new Map<string, CompCounts>();
+  // unit 3-item combos
+  const unitCombos = new Map<string, Map<string, {picks:number;wins:number;sumPlacement:number}>>();
 
-export function finalizeUnitCombos(
-  unitCombos: UnitComboBag,
-  minPicksItemCombo: number,
-  topN = 10
-): UnitComboRow[] {
-  const out: UnitComboRow[] = [];
-  for (const [unit, bag] of unitCombos) {
-    const rows = [] as UnitComboRow["combos"];
-    for (const [cKey, c] of bag) {
-      if (c.picks < minPicksItemCombo) continue;
-      rows.push({
-        combo: cKey.split("|"),
-        picks: c.picks,
-        avg_placement: +(c.sumPlacement / c.picks).toFixed(2),
-        winrate: +(c.wins / c.picks * 100).toFixed(1)
-      });
+  for (const s of slices) {
+    if (PATCH && s.patch !== PATCH) continue;
+
+    // comp aggregation
+    const key = `${s.patch}::${compSignature(s.units as any)}`;
+    let bag = compBuckets.get(key);
+    if (!bag) {
+      bag = { patch: s.patch, comp_key: key.split("::")[1], picks: 0, wins: 0, sumPlacement: 0, units: new Map(), unit_set: unitSet(s.units as any) };
+      compBuckets.set(key, bag);
     }
-    rows.sort((a,b)=> a.avg_placement - b.avg_placement || b.picks - a.picks);
-    out.push({ unit, combos: rows.slice(0, topN) });
-  }
-  // Keep units with at least one combo
-  return out.filter(u => u.combos.length > 0);
-}
-
-// ----- merging state across runs (same patch only) -----
-
-export function mergeCompBuckets(
-  base: Map<string, CompCounts>,
-  add: Map<string, CompCounts>
-) {
-  for (const [k, c] of add) {
-    const cur = base.get(k);
-    if (!cur) { base.set(k, c); continue; }
-    cur.picks += c.picks;
-    cur.wins += c.wins;
-    cur.sumPlacement += c.sumPlacement;
-    for (const [cid, bag] of c.units) {
-      let dest = cur.units.get(cid);
-      if (!dest) { dest = new Map(); cur.units.set(cid, dest); }
-      for (const [item, cnt] of bag) dest.set(item, (dest.get(item)||0)+cnt);
+    bag.picks += 1;
+    if (s.placement === 1) bag.wins += 1;
+    bag.sumPlacement += s.placement ?? 9;
+    for (const u of s.units) {
+      let itemBag = bag.units.get(u.character_id);
+      if (!itemBag) { itemBag = new Map(); bag.units.set(u.character_id, itemBag); }
+      for (const it of (u.items||[])) itemBag.set(String(it), (itemBag.get(String(it))||0)+1);
     }
-  }
-  return base;
-}
 
-export function mergeUnitCombos(
-  base: UnitComboBag,
-  add: UnitComboBag
-) {
-  for (const [unit, bag] of add) {
-    let dest = base.get(unit);
-    if (!dest) { dest = new Map(); base.set(unit, dest); }
-    for (const [combo, c] of bag) {
-      const cur = dest.get(combo);
-      if (!cur) { dest.set(combo, { ...c }); }
-      else {
-        cur.picks += c.picks;
-        cur.wins += c.wins;
-        cur.sumPlacement += c.sumPlacement;
+    // unit combos (independent of comp)
+    for (const u of s.units) {
+      const items = (u.items||[]).map(String);
+      if (items.length < 3) continue;
+      const combos = combosOf3(items);
+      let dest = unitCombos.get(u.character_id);
+      if (!dest) { dest = new Map(); unitCombos.set(u.character_id, dest); }
+      for (const c of combos) {
+        const cur = dest.get(c) || { picks: 0, wins: 0, sumPlacement: 0 };
+        cur.picks += 1;
+        if (s.placement === 1) cur.wins += 1;
+        cur.sumPlacement += s.placement ?? 9;
+        dest.set(c, cur);
       }
     }
   }
-  return base;
+
+  const comps_top20 = finalizeComps(compBuckets, Number(MIN_PICKS));
+  const unit_item_meta = (function () {
+    const rows: Array<{ unit: string; combos: Array<{ combo: string[]; picks: number; avg_placement: number; winrate: number }> }> = [];
+    for (const [unit, bag] of unitCombos) {
+      const list: any[] = [];
+      for (const [combo, c] of bag) {
+        if (c.picks < Number(MIN_PICKS_ITEM_COMBO)) continue;
+        list.push({
+          combo: combo.split("|"),
+          picks: c.picks,
+          avg_placement: +(c.sumPlacement / c.picks).toFixed(2),
+          winrate: +(c.wins / c.picks * 100).toFixed(1)
+        });
+      }
+      list.sort((a,b)=> a.avg_placement - b.avg_placement || b.picks - a.picks);
+      if (list.length) rows.push({ unit, combos: list.slice(0,10) });
+    }
+    return rows;
+  })();
+
+  await fs.mkdir("data", { recursive: true });
+  const payload = {
+    generated_at: new Date().toISOString(),
+    patch: PATCH || "(mixed)",
+    thresholds: { min_picks_comp: Number(MIN_PICKS), min_picks_item_combo: Number(MIN_PICKS_ITEM_COMBO) },
+    comps_top20,
+    unit_item_meta
+  };
+  await fs.writeFile(path.join("data","meta_current.json"), JSON.stringify(payload, null, 2));
+  await fs.writeFile(path.join("data", `meta_${PATCH || "mixed"}.json`), JSON.stringify(payload, null, 2));
+  console.log(`[Aggregator] Wrote data/meta_current.json with ${comps_top20.length} comps and ${unit_item_meta.length} units`);
 }
+
+run().catch(e => { console.error(e); process.exit(1); });
