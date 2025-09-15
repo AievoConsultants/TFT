@@ -1,3 +1,4 @@
+// src/collector.ts
 import "dotenv/config";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -5,9 +6,10 @@ import pLimit from "p-limit";
 import {
   Platform,
   Region,
+  regionFor,
   leagueEntriesPaged,
   leagueListMasterPlus,
-  summonerById,        // MUST be TFT Summoner endpoint (from riot.ts)
+  summonerById,
   matchIdsByPuuid,
   getMatch,
 } from "./riot.js";
@@ -18,7 +20,7 @@ const {
   PLATFORMS = "NA1,EUW1,KR",
   SEED_SUMMONERS = "1500",
   MATCHES_PER = "20",
-  // Leave PATCH blank to collect ALL patches; aggregator can filter later.
+  // Leave PATCH blank in collector to avoid throwing data away
   PATCH = "",
   // Ranked Standard by default (1100). 1090 Normal, 1130 Hyper Roll, 1160 Double Up.
   QUEUE_FILTER = "1100",
@@ -32,12 +34,6 @@ if (!RIOT_API_KEY) {
 }
 
 // ===== Helpers =====
-function regionFor(p: Platform): Region {
-  if (p === "NA1" || p === "BR1" || p === "LA1" || p === "LA2") return "AMERICAS";
-  if (p === "EUW1" || p === "EUN1" || p === "TR1" || p === "RU") return "EUROPE";
-  return "ASIA"; // KR, JP1, OC1
-}
-
 function normalizePatch(v: string) {
   const m = v?.match?.(/(\d+)\.(\d+)/);
   return m ? `${m[1]}.${m[2]}` : v ?? "unknown";
@@ -46,7 +42,6 @@ function normalizePatch(v: string) {
 async function seedSummonerIdsForPlatform(platform: Platform) {
   const ids: string[] = [];
 
-  // Masters+ (full lists, no paging)
   for (const tier of ["CHALLENGER", "GRANDMASTER", "MASTER"] as const) {
     try {
       const entries = await leagueListMasterPlus(platform, tier, RIOT_API_KEY);
@@ -57,7 +52,6 @@ async function seedSummonerIdsForPlatform(platform: Platform) {
     }
   }
 
-  // Diamond I..IV (pages 1..10)
   for (const div of ["I", "II", "III", "IV"] as const) {
     for (let page = 1; page <= 10; page++) {
       try {
@@ -66,9 +60,7 @@ async function seedSummonerIdsForPlatform(platform: Platform) {
         if (!rows.length) break;
         for (const e of rows) if (e?.summonerId) ids.push(e.summonerId);
       } catch (e: any) {
-        console.warn(
-          `[League] ${platform} DIAMOND ${div} page=${page} failed: ${e?.message || e}`
-        );
+        console.warn(`[League] ${platform} DIAMOND ${div} page=${page} failed: ${e?.message || e}`);
         break;
       }
     }
@@ -105,7 +97,6 @@ async function toPuuids(platform: Platform, ids: string[], cap: number) {
   return puuids;
 }
 
-// What we persist per participant (NDJSON line)
 type Slice = {
   match_id: string;
   platform: Platform;
@@ -118,7 +109,7 @@ type Slice = {
 function withinAge(info: any, maxDays: number): boolean {
   if (!maxDays || maxDays <= 0) return true;
   let t: number | undefined = info?.game_datetime ?? info?.gameDateTime;
-  if (typeof t !== "number") return true; // can't tell; keep it
+  if (typeof t !== "number") return true; // keep if unknown
   if (t < 1e12) t = t * 1000; // seconds → ms
   const ageDays = (Date.now() - t) / (1000 * 60 * 60 * 24);
   return ageDays <= maxDays;
@@ -133,7 +124,6 @@ async function run() {
   await fs.mkdir(outDir, { recursive: true });
   const outFile = path.join(outDir, `participants-${today}.ndjson`);
 
-  // dedupe across runs
   const stateDir = path.join("data", "state");
   await fs.mkdir(stateDir, { recursive: true });
   const seenPath = path.join(stateDir, "seen_match_ids.json");
@@ -141,9 +131,7 @@ async function run() {
   let seen = new Set<string>();
   try {
     seen = new Set(JSON.parse(await fs.readFile(seenPath, "utf8")));
-  } catch {
-    // first run is fine
-  }
+  } catch {}
 
   let totalAppended = 0;
   const queueFilterNum = QUEUE_FILTER ? Number(QUEUE_FILTER) : 0;
@@ -165,9 +153,7 @@ async function run() {
           try {
             const arr = await matchIdsByPuuid(region, puuid, Number(MATCHES_PER), RIOT_API_KEY);
             for (const id of arr) matchIds.add(id);
-          } catch {
-            // ignore single puuid failures
-          }
+          } catch {}
         })
       )
     );
@@ -185,12 +171,12 @@ async function run() {
             const m = await getMatch(region, mid, RIOT_API_KEY);
 
             const queue = m?.info?.queue_id ?? m?.info?.queueId;
-            if (queueFilterNum && Number(queue) !== queueFilterNum) return; // ranked-only default
+            if (queueFilterNum && Number(queue) !== queueFilterNum) return;
 
             const patch = normalizePatch(m?.info?.game_version);
-            if (PATCH && patch !== PATCH) return; // optional collector-time patch filter
+            if (PATCH && patch !== PATCH) return; // collector-time patch filter (normally blank)
 
-            if (!withinAge(m?.info, maxAgeDaysNum)) return; // recency filter
+            if (!withinAge(m?.info, maxAgeDaysNum)) return;
 
             for (const p of m?.info?.participants || []) {
               const units = (p.units || []).map((u: any) => ({
@@ -213,9 +199,7 @@ async function run() {
             }
 
             seen.add(mid);
-          } catch {
-            // ignore single match failures; continue
-          }
+          } catch {}
         })
       )
     );
@@ -229,7 +213,7 @@ async function run() {
     }
   }
 
-  const keep = Array.from(seen).slice(-500000); // cap state size
+  const keep = Array.from(seen).slice(-500000);
   await fs.writeFile(seenPath, JSON.stringify(keep));
 
   console.log(`[Collector] wrote total ${totalAppended} slices → ${outFile}`);
