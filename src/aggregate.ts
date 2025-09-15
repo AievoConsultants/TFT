@@ -1,3 +1,4 @@
+// src/aggregator.ts
 import "dotenv/config";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -175,8 +176,8 @@ async function run() {
   };
 
   await fs.mkdir("data", { recursive: true });
-  await fs.writeFile(path.join("data", "meta_current.json"), JSON.stringify(payload, null, 2));
-  await fs.writeFile(path.join("data", `meta_${PATCH}.json`), JSON.stringify(payload, null, 2));
+  await fs.writeFile("data/meta_current.json", JSON.stringify(payload, null, 2));
+  await fs.writeFile(`data/meta_${PATCH}.json`, JSON.stringify(payload, null, 2));
   console.log(
     `[Aggregator] Wrote data/meta_current.json with ${comps_top20.length} comps and ${unit_item_meta.length} units`
   );
