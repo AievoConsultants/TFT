@@ -1,0 +1,49 @@
+name: Collect TFT Slices
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 */6 * * *"  # every 6 hours
+
+permissions:
+  contents: write
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Smoke test Riot key
+        run: |
+          CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "X-Riot-Token: ${{ secrets.RIOT_API_KEY }}" \
+            https://na1.api.riotgames.com/tft/league/v1/master)
+          echo "Riot key HTTP=$CODE"; [ "$CODE" = "200" ]
+
+      - name: Install deps
+        run: npm install --no-audit --no-fund
+
+      - name: Make .env
+        run: |
+          cp .env.example .env
+          sed -i "s|replace_me|${{ secrets.RIOT_API_KEY }}|g" .env
+          echo "PLATFORMS=NA1,EUW1,KR" >> .env
+          echo "SEED_SUMMONERS=1500" >> .env
+          echo "MATCHES_PER=20" >> .env
+          echo "PATCH=15.4" >> .env   # set blank to collect all
+
+      - name: Collect slices
+        run: npm run collect
+
+      - name: Commit slices & state
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -f data/staging/** data/state/** || true
+          git commit -m "Collect slices" || true
+          git push || true
