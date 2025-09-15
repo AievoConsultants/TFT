@@ -1,9 +1,7 @@
-name: Collect TFT Slices
+name: Collect TFT Slices (debug)
 
 on:
-  workflow_dispatch:        # <-- this makes the "Run workflow" button appear
-  schedule:
-    - cron: "0 */6 * * *"   # optional: every 6 hours
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -11,8 +9,6 @@ permissions:
 jobs:
   collect:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
-
     steps:
       - uses: actions/checkout@v4
 
@@ -20,46 +16,45 @@ jobs:
         with:
           node-version: 20
 
-      - name: Install deps
-        run: npm ci || npm i --no-audit --no-fund
-
-      - name: Make .env
-        shell: bash
+      - name: Smoke test Riot key
         run: |
-          set -euo pipefail
+          CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "X-Riot-Token: ${{ secrets.RIOT_API_KEY }}" \
+            https://na1.api.riotgames.com/tft/league/v1/master)
+          echo "Riot key HTTP=$CODE"; [ "$CODE" = "200" ]
+
+      - name: Install deps
+        run: npm install --no-audit --no-fund
+
+      - name: Make .env (debug: no filters)
+        run: |
           cp .env.example .env
           sed -i "s|replace_me|${{ secrets.RIOT_API_KEY }}|g" .env
-          {
-            echo "PLATFORMS=NA1,EUW1,KR"
-            echo "SEED_SUMMONERS=500"     # smaller for quick debug pass
-            echo "MATCHES_PER=10"
-            echo "PATCH="                 # collect ALL patches (blank)
-            echo "QUEUE_FILTER="          # allow any queue for this debug run
-            echo "MAX_AGE_DAYS=0"         # no age filter for this debug run
-          } >> .env
+          echo "PLATFORMS=NA1,EUW1,KR" >> .env
+          echo "SEED_SUMMONERS=300" >> .env
+          echo "MATCHES_PER=10" >> .env
+          echo "PATCH=" >> .env            # collect ALL patches
+          echo "QUEUE_FILTER=" >> .env     # keep ALL queues (no filter)
+          echo "MAX_AGE_DAYS=0" >> .env    # no age filter
 
       - name: Collect slices
         run: npm run collect
 
       - name: Verify slices & list files
-        shell: bash
         run: |
-          set -e
-          echo "== tree data =="
-          ls -R data || true
+          echo "== tree data =="; ls -R data || true
           echo "== check for NDJSON =="
-          f=$(ls -1 data/staging/*/*.ndjson 2>/dev/null | head -n1 || true)
-          if [[ -z "$f" ]]; then
+          F=$(ls -1 data/staging/*/*.ndjson 2>/dev/null | head -n1 || true)
+          if [ -z "$F" ]; then
             echo "❌ No NDJSON files were written"; exit 1
           fi
-          wc -l "$f" | awk '{print "✅ Lines in", $2, "=", $1}'
-          head -n 5 "$f" || true
+          wc -l "$F" | awk '{print "✅ Lines in", $2, "=", $1}'
+          head -n 5 "$F"
 
       - name: Commit slices & state
-        shell: bash
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -f data/staging/** data/state/** || true
-          git commit -m "Collect slices" || true
+          git commit -m "Collect slices (debug)" || true
           git push || true
