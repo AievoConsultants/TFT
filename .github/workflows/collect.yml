@@ -28,14 +28,16 @@ jobs:
       - name: Install deps
         run: npm install --no-audit --no-fund
 
-      - name: Make .env
+            - name: Make .env
         run: |
           cp .env.example .env
           sed -i "s|replace_me|${{ secrets.RIOT_API_KEY }}|g" .env
           echo "PLATFORMS=NA1,EUW1,KR" >> .env
-          echo "SEED_SUMMONERS=1500" >> .env
-          echo "MATCHES_PER=20" >> .env
-          echo "PATCH=15.4" >> .env   # set blank to collect all
+          echo "SEED_SUMMONERS=500" >> .env          # smaller for a quick debug pass
+          echo "MATCHES_PER=10" >> .env
+          echo "PATCH=" >> .env                      # <-- BLANK: collect ALL patches
+          echo "QUEUE_FILTER=" >> .env               # <-- BLANK: allow any queue for this test
+          echo "MAX_AGE_DAYS=0" >> .env              # <-- 0 = no age filter for this test
 
       - name: Collect slices
         run: npm run collect
