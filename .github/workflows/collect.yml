@@ -1,4 +1,4 @@
-name: Collect TFT Slices (debug)
+name: Collect TFT Slices
 
 on:
   workflow_dispatch:
@@ -11,50 +11,42 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-
       - name: Smoke test Riot key
         run: |
           CODE=$(curl -s -o /dev/null -w "%{http_code}" \
             -H "X-Riot-Token: ${{ secrets.RIOT_API_KEY }}" \
             https://na1.api.riotgames.com/tft/league/v1/master)
           echo "Riot key HTTP=$CODE"; [ "$CODE" = "200" ]
-
       - name: Install deps
         run: npm install --no-audit --no-fund
-
-      - name: Make .env (debug: no filters)
+      - name: Make .env (filters ON)
         run: |
           cp .env.example .env
           sed -i "s|replace_me|${{ secrets.RIOT_API_KEY }}|g" .env
           echo "PLATFORMS=NA1,EUW1,KR" >> .env
-          echo "SEED_SUMMONERS=300" >> .env
-          echo "MATCHES_PER=10" >> .env
-          echo "PATCH=" >> .env            # collect ALL patches
-          echo "QUEUE_FILTER=" >> .env     # keep ALL queues (no filter)
-          echo "MAX_AGE_DAYS=0" >> .env    # no age filter
-
+          echo "SEED_SUMMONERS=1500" >> .env
+          echo "MATCHES_PER=20" >> .env
+          echo "PATCH=" >> .env              # keep blank in collector
+          echo "QUEUE_FILTER=1100" >> .env   # ranked Standard
+          echo "MAX_AGE_DAYS=14" >> .env     # last 14 days
       - name: Collect slices
         run: npm run collect
-
       - name: Verify slices & list files
         run: |
           echo "== tree data =="; ls -R data || true
-          echo "== check for NDJSON =="
           F=$(ls -1 data/staging/*/*.ndjson 2>/dev/null | head -n1 || true)
           if [ -z "$F" ]; then
             echo "❌ No NDJSON files were written"; exit 1
           fi
           wc -l "$F" | awk '{print "✅ Lines in", $2, "=", $1}'
-          head -n 5 "$F"
-
+          head -n 5 "$F" || true
       - name: Commit slices & state
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -f data/staging/** data/state/** || true
-          git commit -m "Collect slices (debug)" || true
+          git commit -m "Collect slices" || true
           git push || true
