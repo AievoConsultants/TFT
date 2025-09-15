@@ -1,58 +1,71 @@
 import fetch from "node-fetch";
 
-export type Region = "AMERICAS" | "EUROPE" | "ASIA";
+// ----- Types you can import elsewhere -----
 export type Platform =
-  | "NA1" | "EUW1" | "EUN1" | "KR" | "BR1" | "LA1" | "LA2"
-  | "OC1" | "TR1" | "RU"  | "JP1";
+  | "NA1" | "EUW1" | "EUN1" | "KR" | "JP1" | "BR1" | "LA1" | "LA2" | "OC1" | "TR1" | "RU";
+export type Region = "AMERICAS" | "EUROPE" | "ASIA";
 
-const BASE_MATCH = (region: Region) => `https://${region}.api.riotgames.com`;
-const BASE_PLATFORM = (platform: Platform) => `https://${platform}.api.riotgames.com`;
-const ok = async (r: any) => { if (!r.ok) throw new Error(`${r.status} ${r.statusText}: ${await r.text()}`); return r; };
-
-// ---------- LEAGUE (ladder) ----------
-
-// Non-master tiers (need page + division)
-export async function leagueEntriesPaged(
-  platform: Platform,
-  tier: "DIAMOND" | "EMERALD" | "PLATINUM" | "GOLD" | "SILVER" | "BRONZE" | "IRON",
-  division: "I" | "II" | "III" | "IV",
-  page: number,
-  key: string
-) {
-  const url = `${BASE_PLATFORM(platform)}/tft/league/v1/entries/${tier}/${division}?page=${page}`;
-  const r = await fetch(url, { headers: { "X-Riot-Token": key } }).then(ok);
-  return r.json() as Promise<Array<{ summonerId: string }>>;
+async function fetchJSON(url: string, apiKey: string) {
+  const res = await fetch(url, { headers: { "X-Riot-Token": apiKey } });
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(`${res.status} ${res.statusText} :: ${url} :: ${body.slice(0, 300)}`);
+  }
+  return res.json();
 }
 
-// Master / Grandmaster / Challenger (full list, no paging)
+// ---- League lists (Masters+) ----
 export async function leagueListMasterPlus(
   platform: Platform,
   tier: "CHALLENGER" | "GRANDMASTER" | "MASTER",
-  key: string
-) {
-  const path = tier.toLowerCase(); // challenger|grandmaster|master
-  const url = `${BASE_PLATFORM(platform)}/tft/league/v1/${path}`;
-  const r = await fetch(url, { headers: { "X-Riot-Token": key } }).then(ok);
-  const data = (await r.json()) as { entries?: Array<{ summonerId: string }> };
-  return data.entries ?? [];
+  apiKey: string
+): Promise<Array<{ summonerId: string }>> {
+  const tierPath =
+    tier === "CHALLENGER" ? "challenger" : tier === "GRANDMASTER" ? "grandmaster" : "master";
+  const url = `https://${platform.toLowerCase()}.api.riotgames.com/tft/league/v1/${tierPath}`;
+  const data = (await fetchJSON(url, apiKey)) as any;
+  return (data?.entries ?? []) as Array<{ summonerId: string }>;
 }
 
-// ---------- SUMMONER → PUUID ----------
-export async function summonerById(platform: Platform, summonerId: string, key: string) {
-  const url = `${BASE_PLATFORM(platform)}/tft/summoner/v1/summoners/${encodeURIComponent(summonerId)}`;
-  const r = await fetch(url, { headers: { "X-Riot-Token": key } }).then(ok);
-  return r.json() as Promise<{ puuid: string }>;
+// ---- Diamond paged entries ----
+export async function leagueEntriesPaged(
+  platform: Platform,
+  tier: "DIAMOND",
+  division: "I" | "II" | "III" | "IV",
+  page: number,
+  apiKey: string
+): Promise<Array<{ summonerId: string }>> {
+  const url = `https://${platform.toLowerCase()}.api.riotgames.com/tft/league/v1/entries/${tier}/${division}?page=${page}`;
+  return (await fetchJSON(url, apiKey)) as any[];
 }
 
-// ---------- MATCH ----------
-export async function matchIdsByPuuid(region: Region, puuid: string, count: number, key: string) {
-  const url = `${BASE_MATCH(region)}/tft/match/v1/matches/by-puuid/${encodeURIComponent(puuid)}/ids?start=0&count=${count}`;
-  const r = await fetch(url, { headers: { "X-Riot-Token": key } }).then(ok);
-  return r.json() as Promise<string[]>;
+// ---- *TFT* Summoner by encryptedSummonerId -> includes puuid ----
+export async function summonerById(
+  platform: Platform,
+  encryptedSummonerId: string,
+  apiKey: string
+): Promise<{ puuid: string }> {
+  const url = `https://${platform.toLowerCase()}.api.riotgames.com/tft/summoner/v1/summoners/${encodeURIComponent(
+    encryptedSummonerId
+  )}`;
+  return (await fetchJSON(url, apiKey)) as any;
 }
 
-export async function getMatch(region: Region, matchId: string, key: string) {
-  const url = `${BASE_MATCH(region)}/tft/match/v1/matches/${encodeURIComponent(matchId)}`;
-  const r = await fetch(url, { headers: { "X-Riot-Token": key } }).then(ok);
-  return r.json() as Promise<any>;
+// ---- Match IDs by PUUID ----
+export async function matchIdsByPuuid(
+  region: Region,
+  puuid: string,
+  count: number,
+  apiKey: string
+): Promise<string[]> {
+  const url = `https://${region.toLowerCase()}.api.riotgames.com/tft/match/v1/matches/by-puuid/${encodeURIComponent(
+    puuid
+  )}/ids?count=${count}`;
+  return (await fetchJSON(url, apiKey)) as string[];
+}
+
+// ---- Single Match ----
+export async function getMatch(region: Region, matchId: string, apiKey: string): Promise<any> {
+  const url = `https://${region.toLowerCase()}.api.riotgames.com/tft/match/v1/matches/${matchId}`;
+  return await fetchJSON(url, apiKey);
 }
