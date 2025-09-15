@@ -1,6 +1,5 @@
 import fetch from "node-fetch";
 
-// ----- Types you can import elsewhere -----
 export type Platform =
   | "NA1" | "EUW1" | "EUN1" | "KR" | "JP1" | "BR1" | "LA1" | "LA2" | "OC1" | "TR1" | "RU";
 export type Region = "AMERICAS" | "EUROPE" | "ASIA";
@@ -14,7 +13,12 @@ async function fetchJSON(url: string, apiKey: string) {
   return res.json();
 }
 
-// ---- League lists (Masters+) ----
+export function regionFor(p: Platform): Region {
+  if (p === "NA1" || p === "BR1" || p === "LA1" || p === "LA2") return "AMERICAS";
+  if (p === "EUW1" || p === "EUN1" || p === "TR1" || p === "RU") return "EUROPE";
+  return "ASIA";
+}
+
 export async function leagueListMasterPlus(
   platform: Platform,
   tier: "CHALLENGER" | "GRANDMASTER" | "MASTER",
@@ -27,19 +31,17 @@ export async function leagueListMasterPlus(
   return (data?.entries ?? []) as Array<{ summonerId: string }>;
 }
 
-// ---- Diamond paged entries ----
 export async function leagueEntriesPaged(
   platform: Platform,
-  tier: "DIAMOND",
+  _tier: "DIAMOND",
   division: "I" | "II" | "III" | "IV",
   page: number,
   apiKey: string
 ): Promise<Array<{ summonerId: string }>> {
-  const url = `https://${platform.toLowerCase()}.api.riotgames.com/tft/league/v1/entries/${tier}/${division}?page=${page}`;
+  const url = `https://${platform.toLowerCase()}.api.riotgames.com/tft/league/v1/entries/DIAMOND/${division}?page=${page}`;
   return (await fetchJSON(url, apiKey)) as any[];
 }
 
-// ---- *TFT* Summoner by encryptedSummonerId -> includes puuid ----
 export async function summonerById(
   platform: Platform,
   encryptedSummonerId: string,
@@ -51,7 +53,6 @@ export async function summonerById(
   return (await fetchJSON(url, apiKey)) as any;
 }
 
-// ---- Match IDs by PUUID ----
 export async function matchIdsByPuuid(
   region: Region,
   puuid: string,
@@ -64,7 +65,6 @@ export async function matchIdsByPuuid(
   return (await fetchJSON(url, apiKey)) as string[];
 }
 
-// ---- Single Match ----
 export async function getMatch(region: Region, matchId: string, apiKey: string): Promise<any> {
   const url = `https://${region.toLowerCase()}.api.riotgames.com/tft/match/v1/matches/${matchId}`;
   return await fetchJSON(url, apiKey);
