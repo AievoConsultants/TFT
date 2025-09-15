@@ -1,3 +1,4 @@
+// src/collector.ts
 import "dotenv/config";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -8,32 +9,34 @@ import {
   matchIdsByPuuid, getMatch
 } from "./riot.js";
 
+// === Minimal env (key + optional knobs) ===
 const {
   RIOT_API_KEY,
   PLATFORMS = "NA1,EUW1,KR",
-  SEED_SUMMONERS = "1500",
-  MATCHES_PER = "20",
-  PATCH = "",                 // keep BLANK in collector
-  QUEUE_FILTER = "1100",      // keep ranked Standard
-  MAX_AGE_DAYS = "14"         // last 14 days
+  SEED_SUMMONERS = "1500",     // width: how many Diamond+ accounts per platform to sample
+  MAX_AGE_DAYS = "7"           // recency window (days). "most current" default = 7
 } = process.env as Record<string,string>;
 
 if (!RIOT_API_KEY) { console.error("Missing RIOT_API_KEY"); process.exit(1); }
+
+// === Hard filters per your request ===
+const RANKED_QUEUE = 1100;     // TFT Ranked (Standard) only
+const MATCHES_PER = 20;        // recent matches per PUUID (depth). keep fixed.
 
 function normalizePatch(v: string) {
   const m = v?.match?.(/(\d+)\.(\d+)/);
   return m ? `${m[1]}.${m[2]}` : v ?? "unknown";
 }
-
 function withinAge(info: any, maxDays: number): boolean {
-  if (!maxDays || maxDays <= 0) return true;
+  const d = Number(maxDays) || 0;
+  if (!d) return true;
   let t: number | undefined = info?.game_datetime ?? info?.gameDateTime;
   if (typeof t !== "number") return true;
-  if (t < 1e12) t = t * 1000;
-  const ageDays = (Date.now() - t) / (1000 * 60 * 60 * 24);
-  return ageDays <= maxDays;
+  if (t < 1e12) t *= 1000;
+  return (Date.now() - t) / 86400000 <= d;
 }
 
+// --- seed Diamond+ accounts (Challenger/GM/Master lists + Diamond pages) ---
 async function seedSummonerIdsForPlatform(platform: Platform) {
   const ids: string[] = [];
   for (const tier of ["CHALLENGER","GRANDMASTER","MASTER"] as const) {
@@ -57,7 +60,7 @@ async function seedSummonerIdsForPlatform(platform: Platform) {
 }
 
 async function toPuuids(platform: Platform, ids: string[], cap: number) {
-  const limit = pLimit(8); // ↓ concurrency to avoid 429s
+  const limit = pLimit(8);
   let failures = 0;
   const out = await Promise.all(ids.slice(0, cap).map(id =>
     limit(async () => {
@@ -82,7 +85,7 @@ type Slice = {
 async function run() {
   const platforms = PLATFORMS.split(",").map(s=>s.trim()).filter(Boolean) as Platform[];
   const today = new Date().toISOString().slice(0,10).replace(/-/g,"");
-  const outDir = path.join("data","staging", PATCH ? PATCH : "all");
+  const outDir = path.join("data","staging","all"); // always write to ALL (no patch filter here)
   await fs.mkdir(outDir, { recursive: true });
   const outFile = path.join(outDir, `participants-${today}.ndjson`);
 
@@ -94,7 +97,6 @@ async function run() {
   try { seen = new Set(JSON.parse(await fs.readFile(seenPath,"utf8"))); } catch {}
 
   let totalAppended = 0;
-  const queueFilterNum = QUEUE_FILTER ? Number(QUEUE_FILTER) : 0;
   const maxAgeDaysNum = Number(MAX_AGE_DAYS) || 0;
 
   for (const platform of platforms) {
@@ -102,50 +104,56 @@ async function run() {
     console.log(`[Platform] ${platform} seeding…`);
     const ids = await seedSummonerIdsForPlatform(platform);
     const puuids = await toPuuids(platform, ids, Number(SEED_SUMMONERS));
-    if (puuids.length === 0) { console.warn(`[PUUID] ${platform} none resolved`); continue; }
+    if (!puuids.length) { console.warn(`[PUUID] ${platform} none resolved`); continue; }
 
-    // ↓ concurrency to reduce 429s
     const limitIds = pLimit(8);
     const matchIds = new Set<string>();
     await Promise.all(puuids.map(puuid =>
       limitIds(async () => {
         try {
-          const arr = await matchIdsByPuuid(region, puuid, Number(MATCHES_PER), RIOT_API_KEY);
+          const arr = await matchIdsByPuuid(region, puuid, MATCHES_PER, RIOT_API_KEY);
           for (const id of arr) matchIds.add(id);
-        } catch (e:any) { /* ignore single PUUID errors */ }
+        } catch {}
       })
     ));
     console.log(`[MatchIDs] ${platform} total=${matchIds.size}`);
-    if (matchIds.size === 0) continue;
+    if (!matchIds.size) continue;
 
-    const limitMatch = pLimit(4); // ↓ concurrency for match fetches
+    const limitMatch = pLimit(4);
     const lines: string[] = [];
+    let dropQueue=0, dropAge=0, dropEmpty=0;
+
     await Promise.all([...matchIds].map(mid =>
       limitMatch(async () => {
         if (seen.has(mid)) return;
         try {
           const m = await getMatch(region, mid, RIOT_API_KEY);
+
           const queue = m?.info?.queue_id ?? m?.info?.queueId;
-          if (queueFilterNum && Number(queue) !== queueFilterNum) return; // keep ranked only
+          if (Number(queue) !== RANKED_QUEUE) { dropQueue++; return; } // RANKED ONLY
+
+          if (!withinAge(m?.info, maxAgeDaysNum)) { dropAge++; return; } // RECENT ONLY
 
           const patch = normalizePatch(m?.info?.game_version);
-          if (PATCH && patch !== PATCH) return; // (leave PATCH blank in collector)
+          const parts = m?.info?.participants || [];
+          if (!parts.length) { dropEmpty++; return; }
 
-          if (!withinAge(m?.info, maxAgeDaysNum)) return; // last 14 days
-
-          for (const p of (m?.info?.participants || [])) {
+          for (const p of parts) {
             const units = (p.units || []).map((u:any)=>({
               character_id: u.character_id,
               items: Array.isArray(u.items) ? u.items : (Array.isArray(u.itemNames) ? u.itemNames : [])
             }));
-            const slice: Slice = { match_id: mid, platform, region, patch, placement: p.placement ?? 9, units };
-            lines.push(JSON.stringify(slice));
+            lines.push(JSON.stringify({
+              match_id: mid, platform, region, patch,
+              placement: p.placement ?? 9, units
+            }));
           }
           seen.add(mid);
-        } catch (e:any) { /* ignore single-match failures */ }
+        } catch {}
       })
     ));
 
+    console.log(`[Filters] dropQueue=${dropQueue} dropAge=${dropAge} dropEmpty=${dropEmpty}`);
     if (lines.length) {
       await fs.appendFile(outFile, lines.join("\n") + "\n", "utf8");
       console.log(`[Write] ${platform} appended ${lines.length} slices to ${outFile}`);
@@ -158,9 +166,7 @@ async function run() {
   const keep = Array.from(seen).slice(-500000);
   await fs.writeFile(seenPath, JSON.stringify(keep));
   console.log(`[Collector] wrote total ${totalAppended} slices → ${outFile}`);
-  if (totalAppended === 0) {
-    console.warn("[Collector] 0 slices appended — likely rate-limit or filters too strict.");
-  }
+  if (totalAppended === 0) console.warn("[Collector] 0 slices appended — check PUUID/filters logs above.");
 }
 
 run().catch(e => { console.error(e); process.exit(1); });
