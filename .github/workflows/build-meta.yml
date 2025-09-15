@@ -20,6 +20,16 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
+      - name: Smoke test Riot key
+        run: |
+          CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "X-Riot-Token: ${{ secrets.RIOT_API_KEY }}" \
+            https://na1.api.riotgames.com/tft/league/v1/master)
+          echo "Riot key HTTP=$CODE"
+          if [ "$CODE" != "200" ]; then
+            echo "Riot key is not working (HTTP $CODE). Refresh RIOT_API_KEY secret."
+            exit 1
+          fi
 
       - name: Install dependencies
         run: npm install --no-audit --no-fund
