@@ -1,0 +1,44 @@
+name: Aggregate TFT Meta
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "5 */6 * * *"  # 5 minutes after collector
+
+permissions:
+  contents: write
+
+jobs:
+  aggregate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install deps
+        run: npm install --no-audit --no-fund
+
+      - name: Make .env
+        run: |
+          cp .env.example .env
+          echo "PATCH=15.4" >> .env
+          echo "MIN_PICKS=200" >> .env
+          echo "MIN_PICKS_ITEM_COMBO=50" >> .env
+
+      - name: Aggregate
+        run: npm run aggregate
+
+      - name: Verify output
+        run: |
+          node -e "const fs=require('fs');const j=JSON.parse(fs.readFileSync('data/meta_current.json','utf8'));const a=(j.comps_top20||[]).length;const b=(j.unit_item_meta||[]).length;console.log('Top20:',a,' ItemUnits:',b);if(a===0||b===0){process.exit(1)}"
+
+      - name: Commit meta
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -f data/meta_* || true
+          git commit -m "Update meta" || true
+          git push || true
