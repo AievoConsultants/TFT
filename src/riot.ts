@@ -1,3 +1,4 @@
+// src/riot.ts
 import fetch from "node-fetch";
 
 export type Platform =
