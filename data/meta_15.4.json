@@ -1,0 +1,25 @@
+{
+  "generated_at": "2025-09-15T21:06:14.158Z",
+  "patch": "15.4",
+  "platforms": [
+    "NA1",
+    "EUW1",
+    "KR"
+  ],
+  "ranks_included": [
+    "DIAMOND",
+    "MASTER",
+    "GRANDMASTER",
+    "CHALLENGER"
+  ],
+  "seed_summoners_per_platform": 1500,
+  "matches_per_puuid": 20,
+  "thresholds": {
+    "min_picks_comp": 200,
+    "min_picks_item_combo": 50
+  },
+  "comps_top20": [],
+  "unit_item_meta": [],
+  "__comp": [],
+  "__unitCombos": []
+}
