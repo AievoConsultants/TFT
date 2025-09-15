@@ -1,0 +1,4 @@
+# never commit secrets or big outputs
+.env
+node_modules
+data/*.json
