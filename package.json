@@ -4,8 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "tsx src/pipeline.ts",
-    "build": "tsc --noEmit"
+    "collect": "tsx src/collector.ts",
+    "aggregate": "tsx src/aggregator.ts"
   },
   "dependencies": {
     "dotenv": "^16.4.5",
