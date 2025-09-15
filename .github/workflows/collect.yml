@@ -14,26 +14,28 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-      - name: Smoke test Riot key
+
+      # Build the .env used by the collector (ranked + recent only)
+      - name: Make .env (Diamond+ ranked, most current)
         run: |
-          CODE=$(curl -s -o /dev/null -w "%{http_code}" \
-            -H "X-Riot-Token: ${{ secrets.RIOT_API_KEY }}" \
-            https://na1.api.riotgames.com/tft/league/v1/master)
-          echo "Riot key HTTP=$CODE"; [ "$CODE" = "200" ]
+          KEY="${{ secrets.RIOT_API_KEY }}"
+          KEY="$(printf %s "$KEY" | tr -d '\r\n\t ')"   # trim hidden whitespace
+          {
+            echo "RIOT_API_KEY=$KEY"
+            echo "PLATFORMS=NA1,EUW1,KR"
+            echo "SEED_SUMMONERS=1500"   # width; not a filter
+            echo "MATCHES_PER=10"        # depth; not a filter
+            echo "PATCH="                # keep BLANK in collector
+            echo "QUEUE_FILTER=1100"     # ranked only
+            echo "MAX_AGE_DAYS=7"        # “most current” (change to 3/14 as you like)
+          } > .env
+
       - name: Install deps
         run: npm install --no-audit --no-fund
-      - name: Make .env (filters ON)
-        run: |
-          cp .env.example .env
-          sed -i "s|replace_me|${{ secrets.RIOT_API_KEY }}|g" .env
-          echo "PLATFORMS=NA1,EUW1,KR" >> .env
-          echo "SEED_SUMMONERS=1500" >> .env
-          echo "MATCHES_PER=20" >> .env
-          echo "PATCH=" >> .env              # keep blank in collector
-          echo "QUEUE_FILTER=1100" >> .env   # ranked Standard
-          echo "MAX_AGE_DAYS=14" >> .env     # last 14 days
+
       - name: Collect slices
         run: npm run collect
+
       - name: Verify slices & list files
         run: |
           echo "== tree data =="; ls -R data || true
@@ -43,6 +45,7 @@ jobs:
           fi
           wc -l "$F" | awk '{print "✅ Lines in", $2, "=", $1}'
           head -n 5 "$F" || true
+
       - name: Commit slices & state
         run: |
           git config user.name "github-actions[bot]"
