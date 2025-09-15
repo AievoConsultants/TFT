@@ -1,0 +1,147 @@
+import "dotenv/config";
+import fs from "node:fs/promises";
+import path from "node:path";
+import pLimit from "p-limit";
+import {
+  Platform, Region,
+  leagueEntriesPaged, leagueListMasterPlus, summonerById,
+  matchIdsByPuuid, getMatch
+} from "./riot.js";
+
+// ---- ENV ----
+const {
+  RIOT_API_KEY,
+  PLATFORMS = "NA1,EUW1,KR",
+  SEED_SUMMONERS = "1500",
+  MATCHES_PER = "20",
+  PATCH = "" // if set, keep only that patch; if blank, keep all
+} = process.env as Record<string,string>;
+
+if (!RIOT_API_KEY) { console.error("Missing RIOT_API_KEY"); process.exit(1); }
+
+function regionFor(p: Platform): Region {
+  if (p === "NA1" || p === "BR1" || p === "LA1" || p === "LA2") return "AMERICAS";
+  if (p === "EUW1" || p === "EUN1" || p === "TR1" || p === "RU") return "EUROPE";
+  return "ASIA"; // KR, JP1, OC1
+}
+function normalizePatch(v: string) {
+  const m = v?.match?.(/(\d+)\.(\d+)/);
+  return m ? `${m[1]}.${m[2]}` : v ?? "unknown";
+}
+
+async function seedSummonerIdsForPlatform(platform: Platform) {
+  const ids: string[] = [];
+  for (const tier of ["CHALLENGER","GRANDMASTER","MASTER"] as const) {
+    try {
+      const entries = await leagueListMasterPlus(platform, tier, RIOT_API_KEY);
+      console.log(`[League] ${platform} ${tier} entries=${entries.length}`);
+      for (const e of entries) e?.summonerId && ids.push(e.summonerId);
+    } catch (e:any) { console.warn(`[League] ${platform} ${tier} failed: ${e?.message||e}`); }
+  }
+  for (const div of ["I","II","III","IV"] as const) {
+    for (let page=1; page<=10; page++) {
+      try {
+        const rows = await leagueEntriesPaged(platform, "DIAMOND", div, page, RIOT_API_KEY);
+        console.log(`[League] ${platform} DIAMOND ${div} page=${page} rows=${rows.length}`);
+        if (!rows.length) break;
+        for (const e of rows) e?.summonerId && ids.push(e.summonerId);
+      } catch (e:any) { console.warn(`[League] ${platform} DIAMOND ${div} page=${page} failed: ${e?.message||e}`); break; }
+    }
+  }
+  return [...new Set(ids)];
+}
+
+async function toPuuids(platform: Platform, ids: string[], cap: number) {
+  const limit = pLimit(16);
+  const out = await Promise.all(ids.slice(0, cap).map(id =>
+    limit(async () => {
+      try { return (await summonerById(platform, id, RIOT_API_KEY))?.puuid ?? null; }
+      catch { return null; }
+    })
+  ));
+  return [...new Set(out.filter(Boolean) as string[])];
+}
+
+type Slice = {
+  match_id: string;
+  platform: Platform;
+  region: Region;
+  patch: string;
+  placement: number;
+  units: Array<{ character_id: string; items: Array<number|string> }>;
+};
+
+async function run() {
+  const platforms = PLATFORMS.split(",").map(s => s.trim()).filter(Boolean) as Platform[];
+  const today = new Date().toISOString().slice(0,10).replace(/-/g,"");
+  const patchDir = PATCH ? PATCH : "all";
+  const outDir = path.join("data","staging", patchDir);
+  await fs.mkdir(outDir, { recursive: true });
+  const outFile = path.join(outDir, `participants-${today}.ndjson`);
+  const stateDir = path.join("data","state");
+  await fs.mkdir(stateDir, { recursive: true });
+  const seenPath = path.join(stateDir, "seen_match_ids.json");
+
+  // load seen ids so we don't re-write duplicates
+  let seen = new Set<string>();
+  try { seen = new Set(JSON.parse(await fs.readFile(seenPath,"utf8"))); } catch {}
+
+  let written = 0;
+
+  for (const platform of platforms) {
+    const region = regionFor(platform);
+    console.log(`[Platform] ${platform} seeding…`);
+    const ids = await seedSummonerIdsForPlatform(platform);
+    const puuids = await toPuuids(platform, ids, Number(SEED_SUMMONERS));
+    console.log(`[PUUID] ${platform} unique=${puuids.length}`);
+
+    const limitIds = pLimit(16);
+    const matchIds = new Set<string>();
+    await Promise.all(puuids.map(puuid =>
+      limitIds(async () => {
+        try {
+          const arr = await matchIdsByPuuid(region, puuid, Number(MATCHES_PER), RIOT_API_KEY);
+          for (const id of arr) matchIds.add(id);
+        } catch {}
+      })
+    ));
+
+    const limitMatch = pLimit(8);
+    const lines: string[] = [];
+    await Promise.all([...matchIds].map(mid =>
+      limitMatch(async () => {
+        if (seen.has(mid)) return;
+        try {
+          const m = await getMatch(region, mid, RIOT_API_KEY);
+          const patch = normalizePatch(m?.info?.game_version);
+          if (PATCH && patch !== PATCH) return;
+          for (const p of (m?.info?.participants || [])) {
+            const units = (p.units || []).map((u:any)=>({
+              character_id: u.character_id,
+              items: Array.isArray(u.items) ? u.items : (Array.isArray(u.itemNames) ? u.itemNames : [])
+            }));
+            const slice: Slice = {
+              match_id: mid, platform, region, patch,
+              placement: p.placement ?? 9, units
+            };
+            lines.push(JSON.stringify(slice));
+          }
+          seen.add(mid);
+        } catch {}
+      })
+    ));
+
+    if (lines.length) {
+      await fs.appendFile(outFile, lines.join("\n") + "\n", "utf8");
+      written += lines.length;
+    }
+  }
+
+  // persist seen ids (cap size)
+  const keep = Array.from(seen).slice(-500000);
+  await fs.writeFile(seenPath, JSON.stringify(keep));
+
+  console.log(`[Collector] wrote ${written} participant slices to ${outFile}`);
+}
+
+run().catch(e => { console.error(e); process.exit(1); });
