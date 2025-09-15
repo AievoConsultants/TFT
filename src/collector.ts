@@ -8,14 +8,19 @@ import {
   matchIdsByPuuid, getMatch
 } from "./riot.js";
 
-// ---- ENV ----
+// ===== ENV =====
 const {
   RIOT_API_KEY,
   PLATFORMS = "NA1,EUW1,KR",
   SEED_SUMMONERS = "1500",
   MATCHES_PER = "20",
-  PATCH = "" // if set, keep only that patch; if blank, keep all
-} = process.env as Record<string,string>;
+  // If PATCH is blank, we keep ALL patches here; aggregator can still filter later.
+  PATCH = "",
+  // Ranked Standard only by default (1100). 1090 Normal, 1130 Hyper Roll, 1160 Double Up.
+  QUEUE_FILTER = "1100",
+  // Drop matches older than N days (0 = no age filter)
+  MAX_AGE_DAYS = "14"
+} = process.env as Record<string, string>;
 
 if (!RIOT_API_KEY) { console.error("Missing RIOT_API_KEY"); process.exit(1); }
 
@@ -24,6 +29,7 @@ function regionFor(p: Platform): Region {
   if (p === "EUW1" || p === "EUN1" || p === "TR1" || p === "RU") return "EUROPE";
   return "ASIA"; // KR, JP1, OC1
 }
+
 function normalizePatch(v: string) {
   const m = v?.match?.(/(\d+)\.(\d+)/);
   return m ? `${m[1]}.${m[2]}` : v ?? "unknown";
@@ -53,12 +59,14 @@ async function seedSummonerIdsForPlatform(platform: Platform) {
 
 async function toPuuids(platform: Platform, ids: string[], cap: number) {
   const limit = pLimit(16);
-  const out = await Promise.all(ids.slice(0, cap).map(id =>
-    limit(async () => {
-      try { return (await summonerById(platform, id, RIOT_API_KEY))?.puuid ?? null; }
-      catch { return null; }
-    })
-  ));
+  const out = await Promise.all(
+    ids.slice(0, cap).map(id =>
+      limit(async () => {
+        try { return (await summonerById(platform, id, RIOT_API_KEY))?.puuid ?? null; }
+        catch { return null; }
+      })
+    )
+  );
   return [...new Set(out.filter(Boolean) as string[])];
 }
 
@@ -66,27 +74,38 @@ type Slice = {
   match_id: string;
   platform: Platform;
   region: Region;
-  patch: string;
+  patch: string; // e.g., "15.4"
   placement: number;
   units: Array<{ character_id: string; items: Array<number|string> }>;
 };
+
+function withinAge(info: any, maxDays: number): boolean {
+  if (!maxDays || maxDays <= 0) return true;
+  let t: number | undefined = info?.game_datetime ?? info?.gameDateTime;
+  if (typeof t !== "number") return true; // can’t tell; keep it
+  if (t < 1e12) t = t * 1000; // seconds → ms
+  const ageDays = (Date.now() - t) / (1000 * 60 * 60 * 24);
+  return ageDays <= maxDays;
+}
 
 async function run() {
   const platforms = PLATFORMS.split(",").map(s => s.trim()).filter(Boolean) as Platform[];
   const today = new Date().toISOString().slice(0,10).replace(/-/g,"");
   const patchDir = PATCH ? PATCH : "all";
-  const outDir = path.join("data","staging", patchDir);
+  const outDir = path.join("data", "staging", patchDir);
   await fs.mkdir(outDir, { recursive: true });
   const outFile = path.join(outDir, `participants-${today}.ndjson`);
+
   const stateDir = path.join("data","state");
   await fs.mkdir(stateDir, { recursive: true });
   const seenPath = path.join(stateDir, "seen_match_ids.json");
 
-  // load seen ids so we don't re-write duplicates
   let seen = new Set<string>();
   try { seen = new Set(JSON.parse(await fs.readFile(seenPath,"utf8"))); } catch {}
 
-  let written = 0;
+  let totalAppended = 0;
+  const queueFilterNum = QUEUE_FILTER ? Number(QUEUE_FILTER) : 0;
+  const maxAgeDaysNum = Number(MAX_AGE_DAYS) || 0;
 
   for (const platform of platforms) {
     const region = regionFor(platform);
@@ -105,43 +124,59 @@ async function run() {
         } catch {}
       })
     ));
+    console.log(`[MatchIDs] ${platform} total=${matchIds.size}`);
 
     const limitMatch = pLimit(8);
     const lines: string[] = [];
+
     await Promise.all([...matchIds].map(mid =>
       limitMatch(async () => {
         if (seen.has(mid)) return;
         try {
           const m = await getMatch(region, mid, RIOT_API_KEY);
+          const queue = m?.info?.queue_id ?? m?.info?.queueId;
+          if (queueFilterNum && Number(queue) !== queueFilterNum) return; // ranked-only by default
+
           const patch = normalizePatch(m?.info?.game_version);
-          if (PATCH && patch !== PATCH) return;
+          if (PATCH && patch !== PATCH) return; // (optional) patch filter at collection time
+
+          if (!withinAge(m?.info, maxAgeDaysNum)) return; // recency filter
+
           for (const p of (m?.info?.participants || [])) {
             const units = (p.units || []).map((u:any)=>({
               character_id: u.character_id,
               items: Array.isArray(u.items) ? u.items : (Array.isArray(u.itemNames) ? u.itemNames : [])
             }));
             const slice: Slice = {
-              match_id: mid, platform, region, patch,
-              placement: p.placement ?? 9, units
+              match_id: mid,
+              platform, region, patch,
+              placement: p.placement ?? 9,
+              units
             };
             lines.push(JSON.stringify(slice));
           }
           seen.add(mid);
-        } catch {}
+        } catch {
+          // ignore single-match failures
+        }
       })
     ));
 
     if (lines.length) {
       await fs.appendFile(outFile, lines.join("\n") + "\n", "utf8");
-      written += lines.length;
+      console.log(`[Write] ${platform} appended ${lines.length} slices to ${outFile}`);
+      totalAppended += lines.length;
+    } else {
+      console.log(`[Write] ${platform} appended 0 slices`);
     }
   }
 
-  // persist seen ids (cap size)
   const keep = Array.from(seen).slice(-500000);
   await fs.writeFile(seenPath, JSON.stringify(keep));
-
-  console.log(`[Collector] wrote ${written} participant slices to ${outFile}`);
+  console.log(`[Collector] wrote total ${totalAppended} slices → ${outFile}`);
+  if (totalAppended === 0) {
+    console.warn("[Collector] 0 slices appended — likely queue/patch/age filters too strict.");
+  }
 }
 
 run().catch(e => { console.error(e); process.exit(1); });
