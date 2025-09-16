@@ -1,0 +1,23 @@
+name: Scrape TFT Web Meta
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - run: npm ci || npm i --no-audit --no-fund
+      - run: npm run scrape
+      - name: Commit meta
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -f data/meta_*.json
+          git commit -m "Update web meta" || echo "No changes"
+          git push || true
